@@ -12,7 +12,8 @@ host = "10.0.1.10"
 port = 5432
 user = "backup_user"
 password = "secret"
-dump_globals = true          # pg_dumpall for this server
+dump_globals = true          # pg_dumpall --globals-only (roles/memberships; not schema/data)
+dump_plain_sql = false       # if true, also write full plain-SQL dumps (*.sql.gz) per database
 databases = ["app_db", "analytics_db"]
 
 [[servers]]

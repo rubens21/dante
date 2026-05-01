@@ -37,9 +37,15 @@ docker run --rm \
 
 Ensure `settings.log_file` in the config points to a writable path (e.g. a mounted volume) if logging fails inside the container.
 
+## Backup outputs
 
-# Creating a backup uset
+- **`*_globals_*.sql.gz`** — Cluster globals only (`pg_dumpall --globals-only`): roles, passwords, memberships. It does **not** contain databases, tables, or data. That is expected.
+- **`*_<db>_*.dump.gz`** — Full logical backup per database (custom `-Fc`). Restore with `pg_restore`.
+- **`*_<db>_*.sql.gz`** — Optional full plain-SQL backup per database; set `dump_plain_sql = true` on that server in `backup.conf.toml` if you want human-readable SQL alongside the custom dump.
 
+# Creating a backup user
+
+```sql
 -- ── Run as superuser (postgres) ───────────────────────────────────────────────
 -- Creates the backup user and grants all necessary permissions.
 -- Run once per cluster, then repeat the per-DB section for each database.
@@ -91,3 +97,4 @@ FROM pg_auth_members m
 JOIN pg_roles r ON r.oid = m.roleid
 JOIN pg_roles u ON u.oid = m.member
 WHERE u.rolname = 'backuper';
+```

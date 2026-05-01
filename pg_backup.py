@@ -139,9 +139,9 @@ def backup_server(server: dict, backup_dir: Path, timestamp: str,
     common_args = ["-h", host, "-p", port, "-U", user,
                    "--clean", "--if-exists"]
 
-    # ── Globals dump (roles, users, passwords) ────────────────────────────
+    # ── Globals dump (roles, memberships only — not database DDL/data) ─────
     if server.get("dump_globals", False):
-        logger.info(f"[{name}] Running pg_dumpall (globals)...")
+        logger.info(f"[{name}] Running pg_dumpall (globals-only)...")
         out = backup_dir / f"{name}_globals_{timestamp}.sql.gz"
         cmd = ["pg_dumpall", *common_args, "--globals-only"]
         ok, errs = run_dump(cmd, env, out, logger)
@@ -151,9 +151,11 @@ def backup_server(server: dict, backup_dir: Path, timestamp: str,
             all_errors.extend([f"[{name}] globals: {e}" for e in errs])
             out.unlink(missing_ok=True)   # don't keep corrupt file
 
+    dump_plain = server.get("dump_plain_sql", False)
+
     # ── Per-DB dumps ──────────────────────────────────────────────────────
     for db in server.get("databases", []):
-        logger.info(f"[{name}] Dumping {db}...")
+        logger.info(f"[{name}] Dumping {db} (custom format)...")
         out = backup_dir / f"{name}_{db}_{timestamp}.dump.gz"
         cmd = [
             "pg_dump", *common_args,
@@ -167,6 +169,19 @@ def backup_server(server: dict, backup_dir: Path, timestamp: str,
         else:
             all_errors.extend([f"[{name}/{db}]: {e}" for e in errs])
             out.unlink(missing_ok=True)
+
+        if dump_plain:
+            logger.info(f"[{name}] Dumping {db} (plain SQL)...")
+            sql_out = backup_dir / f"{name}_{db}_{timestamp}.sql.gz"
+            sql_cmd = ["pg_dump", *common_args, "-Fp", db]
+            sql_ok, sql_errs = run_dump(sql_cmd, env, sql_out, logger)
+            if sql_ok:
+                logger.info(f"[{name}] {db} SQL OK → {sql_out.name} "
+                            f"({sql_out.stat().st_size // 1024} KB)")
+            else:
+                all_errors.extend(
+                    [f"[{name}/{db} sql]: {e}" for e in sql_errs])
+                sql_out.unlink(missing_ok=True)
 
     return all_errors
 
