@@ -1,0 +1,25 @@
+# backup.conf.toml  — never commit this
+
+[settings]
+backup_dir = "/backups/postgres"
+retention_days = 14
+healthchecks_url = "https://hc-ping.com/[your-uuid-here]"
+log_file = "/var/log/pg_backup.log"
+
+[[servers]]
+name = "prod-primary"
+host = "10.0.1.10"
+port = 5432
+user = "backup_user"
+password = "secret"
+dump_globals = true          # pg_dumpall for this server
+databases = ["app_db", "analytics_db"]
+
+[[servers]]
+name = "prod-secondary"
+host = "10.0.1.11"
+port = 5432
+user = "backup_user"
+password = "secret"
+dump_globals = false
+databases = ["payments_db"]

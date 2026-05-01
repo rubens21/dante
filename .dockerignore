@@ -1,0 +1,5 @@
+backup.conf.toml
+.git
+.gitignore
+*.md
+__pycache__
