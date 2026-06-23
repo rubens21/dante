@@ -1,3 +1,4 @@
 backup.conf.toml
 backups/
 logs/
+.idea
