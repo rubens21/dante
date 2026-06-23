@@ -140,8 +140,11 @@ def run_aws_command(cmd: list[str], env: dict,
 
         if proc.stderr:
             for line in proc.stderr.splitlines():
-                logger.error(f"  stderr: {line.strip()}")
-                errors.append(line.strip())
+                if proc.returncode != 0:
+                    logger.error(f"  stderr: {line.strip()}")
+                    errors.append(line.strip())
+                else:
+                    logger.debug(f"  aws stderr: {line.strip()}")
 
         if proc.returncode != 0:
             errors.append(f"Process exited with code {proc.returncode}")
@@ -221,6 +224,117 @@ def backup_server(server: dict, backup_dir: Path, timestamp: str,
     return all_errors
 
 
+# ── S3 helpers ────────────────────────────────────────────────────────────────
+
+def resolve_s3_config(block: dict, global_s3: dict) -> dict:
+    """Merge [s3] defaults with block overrides; validate required fields."""
+    merged = {**global_s3, **block}
+
+    bucket = merged.get("bucket")
+    if not bucket:
+        raise ValueError("S3 block missing required field: bucket")
+
+    region = merged.get("region")
+    if not region:
+        raise ValueError("S3 block missing required field: region")
+
+    endpoint_url = merged.get("endpoint_url")
+    if endpoint_url and not re.match(r"^https?://", endpoint_url):
+        raise ValueError(
+            f"Invalid endpoint_url: {endpoint_url!r} "
+            "(must be http:// or https://)"
+        )
+
+    return {
+        "bucket": bucket,
+        "prefix": merged.get("prefix", ""),
+        "region": region,
+        "endpoint_url": endpoint_url,
+        "access_key_id": merged.get("access_key_id"),
+        "secret_access_key": merged.get("secret_access_key"),
+        "addressing_style": merged.get("addressing_style"),
+        "verify_ssl": merged.get("verify_ssl", True),
+    }
+
+
+def _s3_uri(bucket: str, prefix: str) -> str:
+    prefix = prefix.lstrip("/")
+    if prefix:
+        return f"s3://{bucket}/{prefix}"
+    return f"s3://{bucket}/"
+
+
+def _build_s3_env(resolved: dict) -> dict:
+    env = os.environ.copy()
+    if resolved.get("access_key_id"):
+        env["AWS_ACCESS_KEY_ID"] = resolved["access_key_id"]
+    if resolved.get("secret_access_key"):
+        env["AWS_SECRET_ACCESS_KEY"] = resolved["secret_access_key"]
+    if resolved.get("region"):
+        env["AWS_DEFAULT_REGION"] = resolved["region"]
+    if resolved.get("addressing_style"):
+        env["AWS_S3_ADDRESSING_STYLE"] = resolved["addressing_style"]
+    return env
+
+
+def _build_s3_sync_cmd(resolved: dict, src: str, dst: str) -> list[str]:
+    cmd = ["aws"]
+    if not resolved.get("verify_ssl", True):
+        cmd.append("--no-verify-ssl")
+    cmd += ["s3", "sync", src, dst]
+    if resolved.get("region"):
+        cmd += ["--region", resolved["region"]]
+    if resolved.get("endpoint_url"):
+        cmd += ["--endpoint-url", resolved["endpoint_url"]]
+    return cmd
+
+
+def backup_s3_source(source: dict, global_s3: dict, backup_dir: Path,
+                     timestamp: str, logger: logging.Logger) -> list[str]:
+    """Pull an S3 prefix into backup_dir/{name}_{timestamp}/."""
+    name = source["name"]
+    try:
+        resolved = resolve_s3_config(source, global_s3)
+    except ValueError as e:
+        return [f"[{name}] {e}"]
+
+    dst = backup_dir / f"{name}_{timestamp}"
+    dst.mkdir(parents=True, exist_ok=True)
+
+    src = _s3_uri(resolved["bucket"], resolved["prefix"])
+    cmd = _build_s3_sync_cmd(resolved, src, str(dst))
+    env = _build_s3_env(resolved)
+
+    logger.info(f"[{name}] Syncing {src} → {dst.name}/...")
+    ok, errs = run_aws_command(cmd, env, logger)
+    if ok:
+        logger.info(f"[{name}] S3 sync OK → {dst.name}/")
+        return []
+    return [f"[{name}] {e}" for e in errs]
+
+
+def upload_s3_destination(destination: dict, global_s3: dict,
+                          backup_dir: Path,
+                          logger: logging.Logger) -> list[str]:
+    """Upload the full backup_dir to an S3 prefix."""
+    label = "s3_destination"
+    try:
+        resolved = resolve_s3_config(destination, global_s3)
+    except ValueError as e:
+        return [f"[{label}] {e}"]
+
+    dst = _s3_uri(resolved["bucket"], resolved["prefix"])
+    cmd = _build_s3_sync_cmd(resolved, str(backup_dir), dst)
+    env = _build_s3_env(resolved)
+
+    logger.info(f"[{label}] Uploading {backup_dir} → {dst}...")
+    ok, errs = run_aws_command(cmd, env, logger)
+    if ok:
+        logger.info(f"[{label}] S3 upload OK")
+        return []
+    return [f"[{label}] {e}" for e in errs]
+
+
 # ── Retention ─────────────────────────────────────────────────────────────────
 
 def prune_old_backups(backup_dir: Path, retention_days: int,
@@ -252,6 +366,24 @@ def main():
     backup_dir = Path(settings["backup_dir"])
     backup_dir.mkdir(parents=True, exist_ok=True)
 
+    global_s3 = config.get("s3", {})
+    s3_sources = config.get("s3_sources", [])
+    s3_destination = config.get("s3_destination")
+
+    for source in s3_sources:
+        if "name" not in source:
+            sys.exit("ERROR: [[s3_sources]] entry missing required field: name")
+        try:
+            resolve_s3_config(source, global_s3)
+        except ValueError as e:
+            sys.exit(f"ERROR: s3_sources/{source.get('name', '?')}: {e}")
+
+    if s3_destination:
+        try:
+            resolve_s3_config(s3_destination, global_s3)
+        except ValueError as e:
+            sys.exit(f"ERROR: s3_destination: {e}")
+
     hc_url = settings.get("healthchecks_url", "")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
@@ -259,6 +391,10 @@ def main():
     logger.info("Backup run started")
     logger.info(f"Config: {config_path}")
     logger.info(f"Servers: {[s['name'] for s in config['servers']]}")
+    if s3_sources:
+        logger.info(f"S3 sources: {[s['name'] for s in s3_sources]}")
+    if s3_destination:
+        logger.info("S3 destination: configured")
 
     if hc_url:
         ping_healthchecks(hc_url, "/start", logger)
@@ -268,6 +404,16 @@ def main():
 
     for server in config["servers"]:
         errors = backup_server(server, backup_dir, timestamp, logger)
+        all_errors.extend(errors)
+
+    for source in s3_sources:
+        errors = backup_s3_source(source, global_s3, backup_dir,
+                                  timestamp, logger)
+        all_errors.extend(errors)
+
+    if s3_destination:
+        errors = upload_s3_destination(s3_destination, global_s3,
+                                       backup_dir, logger)
         all_errors.extend(errors)
 
     # ── Retention ─────────────────────────────────────────────────────────
