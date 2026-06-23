@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-pg_backup.py — multi-server Postgres backup with Healthchecks.io monitoring.
-Single HC check: only pings success if ALL dumps succeed.
+backup.py — multi-source backup runner (Postgres + S3) with Healthchecks.io monitoring.
+Single HC check: only pings success if ALL backup steps succeed.
 """
 
 import gzip
-import json
 import logging
 import os
 import re
@@ -30,7 +29,7 @@ except ImportError:
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def setup_logging(log_file: str) -> logging.Logger:
-    logger = logging.getLogger("pg_backup")
+    logger = logging.getLogger("dante")
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
@@ -115,6 +114,42 @@ def run_dump(cmd: list[str], env: dict, output_path: Path,
     except Exception as e:
         errors.append(str(e))
         logger.error(f"  Exception during dump: {e}")
+
+    return (len(errors) == 0), errors
+
+
+def run_aws_command(cmd: list[str], env: dict,
+                    logger: logging.Logger) -> tuple[bool, list[str]]:
+    """
+    Run an aws CLI command.
+    Returns (success: bool, errors: list[str]).
+    """
+    errors = []
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                logger.debug(f"  aws stdout: {line.strip()}")
+
+        if proc.stderr:
+            for line in proc.stderr.splitlines():
+                logger.error(f"  stderr: {line.strip()}")
+                errors.append(line.strip())
+
+        if proc.returncode != 0:
+            errors.append(f"Process exited with code {proc.returncode}")
+            logger.error(f"  Exit code: {proc.returncode}")
+
+    except Exception as e:
+        errors.append(str(e))
+        logger.error(f"  Exception during aws command: {e}")
 
     return (len(errors) == 0), errors
 
