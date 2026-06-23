@@ -340,13 +340,23 @@ def upload_s3_destination(destination: dict, global_s3: dict,
 def prune_old_backups(backup_dir: Path, retention_days: int,
                       logger: logging.Logger):
     cutoff = datetime.now().timestamp() - retention_days * 86400
-    removed = 0
-    for f in backup_dir.glob("*"):
-        if f.is_file() and f.stat().st_mtime < cutoff:
-            f.unlink()
-            logger.info(f"Pruned: {f.name}")
-            removed += 1
-    logger.info(f"Pruned {removed} file(s) older than {retention_days} days.")
+    removed_files = 0
+    removed_dirs = 0
+    for entry in backup_dir.glob("*"):
+        if entry.stat().st_mtime >= cutoff:
+            continue
+        if entry.is_file():
+            entry.unlink()
+            logger.info(f"Pruned: {entry.name}")
+            removed_files += 1
+        elif entry.is_dir():
+            shutil.rmtree(entry)
+            logger.info(f"Pruned dir: {entry.name}")
+            removed_dirs += 1
+    logger.info(
+        f"Pruned {removed_files} file(s) and {removed_dirs} dir(s) "
+        f"older than {retention_days} days."
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
