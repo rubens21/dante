@@ -38,11 +38,20 @@ addressing_style = "path"                     # optional: path | virtual | auto 
 verify_ssl = true                             # set false for self-signed TLS
 
 # Pull remote S3 prefixes into backup_dir/{name}_{timestamp}/
+# Set all_buckets = true to discover and sync every bucket the key can list
+# (Garage-compatible via aws s3 ls). Output: {name}_{timestamp}/{bucket}/...
 
 [[s3_sources]]
-name = "assets"
-bucket = "my-assets-bucket"
-prefix = "uploads/"                           # optional, default ""
+name = "garage-all"
+all_buckets = true
+# exclude_buckets = ["scratch", "temp"]   # optional skip list
+
+# Single-bucket source (mutually exclusive with all_buckets):
+
+# [[s3_sources]]
+# name = "assets"
+# bucket = "my-assets-bucket"
+# prefix = "uploads/"                           # optional, default ""
 
 # Per-source overrides (inherit the rest from [s3]):
 # endpoint_url = "http://127.0.0.1:3900"

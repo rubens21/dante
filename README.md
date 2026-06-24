@@ -16,11 +16,27 @@ Run with your config file on the host (adjust host paths as needed). The image e
 
 ```bash
 docker run --rm \
+  --add-host=host.docker.internal:host-gateway \
   -v ./backup.conf.toml:/config/backup.conf.toml:ro \
   -v ./backups:/backups/postgres \
   -v ./logs:/var/log \
   dante-backup
 ```
+
+On Linux, `host.docker.internal` is **not** available unless you pass `--add-host=host.docker.internal:host-gateway` (shown above). Without it, S3/Garage connections to the host will fail.
+
+If Garage runs in Docker on the same machine, you can instead join its compose network and point at the service name:
+
+```bash
+docker run --rm \
+  --network garage_default \
+  -v ./backup.conf.toml:/config/backup.conf.toml:ro \
+  -v ./backups:/backups/postgres \
+  -v ./logs:/var/log \
+  dante-backup
+```
+
+Set `endpoint_url = "http://garage:3900"` in `[s3]` when using this approach.
 
 - Replace `/absolute/path/on/host/backup.conf.toml` with the real path to your TOML config.
 - Mount a host directory for `settings.backup_dir` from your config (the example `backup.conf.toml.example` uses `/backups/postgres`).
@@ -59,7 +75,9 @@ Ensure `settings.log_file` in the config points to a writable path (e.g. a mount
 
 ### S3 sources
 
-Each `[[s3_sources]]` entry pulls a remote prefix into `{backup_dir}/{name}_{timestamp}/`, mirroring the bucket prefix tree. Local retention (`settings.retention_days`) prunes both files and directories.
+Each `[[s3_sources]]` entry pulls remote objects into `{backup_dir}/{name}_{timestamp}/`, mirroring the bucket prefix tree. Local retention (`settings.retention_days`) prunes both files and directories.
+
+With `all_buckets = true`, the runner calls `aws s3 ls` (works with Garage and AWS), then syncs every listed bucket into `{name}_{timestamp}/{bucket}/`. Use `exclude_buckets` to skip buckets you do not want backed up.
 
 ## S3 / Garage connection
 
@@ -94,6 +112,19 @@ For AWS-native usage, omit `endpoint_url` and set `region` to an AWS region on `
 
 ## S3 sources (pull)
 
+**All buckets** (Garage or AWS — key must be able to list buckets):
+
+```toml
+[[s3_sources]]
+name = "garage-all"
+all_buckets = true
+exclude_buckets = ["scratch"]    # optional
+```
+
+Output layout: `{backup_dir}/garage-all_{timestamp}/{bucket}/...`
+
+**Single bucket:**
+
 ```toml
 [[s3_sources]]
 name = "assets"
@@ -101,7 +132,9 @@ bucket = "my-assets-bucket"
 prefix = "uploads/"    # optional, default ""
 ```
 
-Each source needs `name` and `bucket`; `region` is required (on the block or in `[s3]`). Per-source fields override `[s3]` defaults. Missing or empty `[[s3_sources]]` is a no-op — Postgres-only configs keep working.
+Each source needs `name`. Set either `bucket` or `all_buckets = true` (not both). `region` is required (on the block or in `[s3]`). Per-source fields override `[s3]` defaults. Missing or empty `[[s3_sources]]` is a no-op — Postgres-only configs keep working.
+
+The backup key needs **list** access (`aws s3 ls`) for discovery and **read** access (`aws s3 sync`) on each bucket. On Garage, grant the key permissions on the buckets you want included.
 
 ## S3 destination (push)
 

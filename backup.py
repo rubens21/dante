@@ -9,11 +9,13 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Python 3.11+: tomllib is stdlib. For 3.10 and below, install tomli:
 #   pip install tomli
@@ -24,6 +26,53 @@ except ImportError:
         import tomli as tomllib
     except ImportError:
         sys.exit("ERROR: Python < 3.11 detected. Run: pip install tomli")
+
+
+def _probe_s3_endpoint(endpoint_url: str) -> dict:
+    parsed = urlparse(endpoint_url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    probe = {"endpoint_url": endpoint_url, "host": host, "port": port}
+    try:
+        probe["dns_ip"] = socket.gethostbyname(host)
+    except OSError as exc:
+        probe["dns_error"] = str(exc)
+        return probe
+    try:
+        socket.create_connection((host, port), timeout=3).close()
+        probe["tcp_ok"] = True
+    except OSError as exc:
+        probe["tcp_error"] = str(exc)
+    return probe
+
+
+def _validate_s3_endpoint(endpoint_url: str, logger: logging.Logger) -> None:
+    probe = _probe_s3_endpoint(endpoint_url)
+    if probe.get("dns_error"):
+        host = probe.get("host", "")
+        if host == "host.docker.internal":
+            logger.error(
+                "Cannot resolve host.docker.internal from inside the container. "
+                "On Linux, add --add-host=host.docker.internal:host-gateway "
+                "to docker run. Alternatively, join the Garage compose network "
+                '(e.g. --network garage_default) and set '
+                'endpoint_url = "http://garage:3900".'
+            )
+        else:
+            logger.error(
+                f"Cannot resolve S3 host {host!r}: {probe['dns_error']}"
+            )
+        sys.exit(1)
+    if not probe.get("tcp_ok"):
+        logger.error(
+            f"Cannot reach S3 endpoint {endpoint_url!r}: "
+            f"{probe.get('tcp_error', 'unknown error')}"
+        )
+        sys.exit(1)
+    logger.debug(
+        f"S3 endpoint reachable: {endpoint_url} "
+        f"({probe['host']}:{probe['port']} → {probe.get('dns_ip')})"
+    )
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -124,7 +173,18 @@ def run_aws_command(cmd: list[str], env: dict,
     Run an aws CLI command.
     Returns (success: bool, errors: list[str]).
     """
+    ok, errors, _ = run_aws_capture(cmd, env, logger)
+    return ok, errors
+
+
+def run_aws_capture(cmd: list[str], env: dict,
+                    logger: logging.Logger) -> tuple[bool, list[str], str]:
+    """
+    Run an aws CLI command and return captured stdout.
+    Returns (success: bool, errors: list[str], stdout: str).
+    """
     errors = []
+    stdout = ""
 
     try:
         proc = subprocess.run(
@@ -133,9 +193,10 @@ def run_aws_command(cmd: list[str], env: dict,
             env=env,
             text=True,
         )
+        stdout = proc.stdout or ""
 
-        if proc.stdout:
-            for line in proc.stdout.splitlines():
+        if stdout:
+            for line in stdout.splitlines():
                 logger.debug(f"  aws stdout: {line.strip()}")
 
         if proc.stderr:
@@ -154,7 +215,7 @@ def run_aws_command(cmd: list[str], env: dict,
         errors.append(str(e))
         logger.error(f"  Exception during aws command: {e}")
 
-    return (len(errors) == 0), errors
+    return (len(errors) == 0), errors, stdout
 
 
 # ── Backup logic ──────────────────────────────────────────────────────────────
@@ -226,13 +287,21 @@ def backup_server(server: dict, backup_dir: Path, timestamp: str,
 
 # ── S3 helpers ────────────────────────────────────────────────────────────────
 
-def resolve_s3_config(block: dict, global_s3: dict) -> dict:
+def resolve_s3_config(block: dict, global_s3: dict, *,
+                      allow_all_buckets: bool = False) -> dict:
     """Merge [s3] defaults with block overrides; validate required fields."""
     merged = {**global_s3, **block}
-
+    all_buckets = bool(merged.get("all_buckets", False))
     bucket = merged.get("bucket")
-    if not bucket:
-        raise ValueError("S3 block missing required field: bucket")
+
+    if allow_all_buckets and all_buckets:
+        if bucket:
+            raise ValueError("cannot set both bucket and all_buckets = true")
+    elif not bucket:
+        raise ValueError(
+            "S3 block missing required field: bucket "
+            "(or set all_buckets = true on [[s3_sources]])"
+        )
 
     region = merged.get("region")
     if not region:
@@ -245,8 +314,14 @@ def resolve_s3_config(block: dict, global_s3: dict) -> dict:
             "(must be http:// or https://)"
         )
 
+    exclude = merged.get("exclude_buckets", [])
+    if exclude is not None and not isinstance(exclude, list):
+        raise ValueError("exclude_buckets must be a list of bucket names")
+
     return {
         "bucket": bucket,
+        "all_buckets": all_buckets,
+        "exclude_buckets": set(exclude or []),
         "prefix": merged.get("prefix", ""),
         "region": region,
         "endpoint_url": endpoint_url,
@@ -289,28 +364,96 @@ def _build_s3_sync_cmd(resolved: dict, src: str, dst: str) -> list[str]:
     return cmd
 
 
-def backup_s3_source(source: dict, global_s3: dict, backup_dir: Path,
-                     timestamp: str, logger: logging.Logger) -> list[str]:
-    """Pull an S3 prefix into backup_dir/{name}_{timestamp}/."""
-    name = source["name"]
-    try:
-        resolved = resolve_s3_config(source, global_s3)
-    except ValueError as e:
-        return [f"[{name}] {e}"]
+def _build_s3_ls_cmd(resolved: dict) -> list[str]:
+    cmd = ["aws"]
+    if not resolved.get("verify_ssl", True):
+        cmd.append("--no-verify-ssl")
+    cmd += ["s3", "ls"]
+    if resolved.get("region"):
+        cmd += ["--region", resolved["region"]]
+    if resolved.get("endpoint_url"):
+        cmd += ["--endpoint-url", resolved["endpoint_url"]]
+    return cmd
 
-    dst = backup_dir / f"{name}_{timestamp}"
-    dst.mkdir(parents=True, exist_ok=True)
 
-    src = _s3_uri(resolved["bucket"], resolved["prefix"])
+def _parse_s3_ls_buckets(stdout: str) -> list[str]:
+    """Parse bucket names from `aws s3 ls` output (date time bucket)."""
+    buckets = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}", parts[0]):
+            buckets.append(parts[-1])
+    return buckets
+
+
+def list_s3_buckets(resolved: dict,
+                    logger: logging.Logger) -> tuple[list[str] | None, list[str]]:
+    """List bucket names visible to the configured credentials."""
+    cmd = _build_s3_ls_cmd(resolved)
+    env = _build_s3_env(resolved)
+    ok, errs, stdout = run_aws_capture(cmd, env, logger)
+    if not ok:
+        return None, errs
+    return _parse_s3_ls_buckets(stdout), []
+
+
+def _sync_s3_bucket(resolved: dict, bucket: str, dst: Path,
+                    label: str, logger: logging.Logger) -> list[str]:
+    src = _s3_uri(bucket, resolved["prefix"])
     cmd = _build_s3_sync_cmd(resolved, src, str(dst))
     env = _build_s3_env(resolved)
 
-    logger.info(f"[{name}] Syncing {src} → {dst.name}/...")
+    logger.info(f"[{label}] Syncing {src} → {dst.name}/...")
     ok, errs = run_aws_command(cmd, env, logger)
     if ok:
-        logger.info(f"[{name}] S3 sync OK → {dst.name}/")
+        logger.info(f"[{label}] S3 sync OK → {dst.name}/")
         return []
-    return [f"[{name}] {e}" for e in errs]
+    return [f"[{label}] {e}" for e in errs]
+
+
+def backup_s3_source(source: dict, global_s3: dict, backup_dir: Path,
+                     timestamp: str, logger: logging.Logger) -> list[str]:
+    """Pull S3 object(s) into backup_dir/{name}_{timestamp}/."""
+    name = source["name"]
+    try:
+        resolved = resolve_s3_config(source, global_s3, allow_all_buckets=True)
+    except ValueError as e:
+        return [f"[{name}] {e}"]
+
+    base_dst = backup_dir / f"{name}_{timestamp}"
+    base_dst.mkdir(parents=True, exist_ok=True)
+
+    if resolved["all_buckets"]:
+        buckets, errs = list_s3_buckets(resolved, logger)
+        if buckets is None:
+            return [f"[{name}] {e}" for e in errs]
+
+        exclude = resolved["exclude_buckets"]
+        buckets = [b for b in buckets if b not in exclude]
+        if exclude:
+            logger.info(f"[{name}] Excluding bucket(s): {sorted(exclude)}")
+
+        if not buckets:
+            logger.info(f"[{name}] No buckets to sync after discovery.")
+            return []
+
+        logger.info(
+            f"[{name}] Discovered {len(buckets)} bucket(s): "
+            f"{', '.join(buckets)}"
+        )
+
+        all_errors: list[str] = []
+        for bucket in buckets:
+            dst = base_dst / bucket
+            dst.mkdir(parents=True, exist_ok=True)
+            all_errors.extend(
+                _sync_s3_bucket(resolved, bucket, dst, f"{name}/{bucket}",
+                                logger)
+            )
+        return all_errors
+
+    dst = base_dst
+    return _sync_s3_bucket(resolved, resolved["bucket"], dst, name, logger)
 
 
 def upload_s3_destination(destination: dict, global_s3: dict,
@@ -379,12 +522,13 @@ def main():
     global_s3 = config.get("s3", {})
     s3_sources = config.get("s3_sources", [])
     s3_destination = config.get("s3_destination")
+    servers = config.get("servers", [])
 
     for source in s3_sources:
         if "name" not in source:
             sys.exit("ERROR: [[s3_sources]] entry missing required field: name")
         try:
-            resolve_s3_config(source, global_s3)
+            resolve_s3_config(source, global_s3, allow_all_buckets=True)
         except ValueError as e:
             sys.exit(f"ERROR: s3_sources/{source.get('name', '?')}: {e}")
 
@@ -394,15 +538,27 @@ def main():
         except ValueError as e:
             sys.exit(f"ERROR: s3_destination: {e}")
 
+    if global_s3.get("endpoint_url") and (s3_sources or s3_destination):
+        _validate_s3_endpoint(global_s3["endpoint_url"], logger)
+
     hc_url = settings.get("healthchecks_url", "")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
     logger.info("=" * 60)
     logger.info("Backup run started")
     logger.info(f"Config: {config_path}")
-    logger.info(f"Servers: {[s['name'] for s in config['servers']]}")
+    if servers:
+        logger.info(f"Servers: {[s['name'] for s in servers]}")
+    else:
+        logger.warning("No PostgreSQL servers configured; skipping DB backups.")
     if s3_sources:
-        logger.info(f"S3 sources: {[s['name'] for s in s3_sources]}")
+        labels = []
+        for s in s3_sources:
+            if s.get("all_buckets"):
+                labels.append(f"{s['name']} (all buckets)")
+            else:
+                labels.append(s["name"])
+        logger.info(f"S3 sources: {labels}")
     if s3_destination:
         logger.info("S3 destination: configured")
 
@@ -412,7 +568,7 @@ def main():
     # ── Run backups across all servers ────────────────────────────────────
     all_errors: list[str] = []
 
-    for server in config["servers"]:
+    for server in servers:
         errors = backup_server(server, backup_dir, timestamp, logger)
         all_errors.extend(errors)
 
