@@ -24,3 +24,51 @@ user = "backup_user"
 password = "secret"
 dump_globals = false
 databases = ["payments_db"]
+
+# ── S3 / Garage (optional) ────────────────────────────────────────────────────
+# Shared defaults for [[s3_sources]] and [s3_destination].
+# Omit endpoint_url for real AWS; set region to an AWS region (e.g. eu-west-1).
+
+[s3]
+endpoint_url = "https://garage.example.com"   # S3 API base URL (Garage gateway)
+region = "garage"                             # must match Garage cluster region name
+access_key_id = "GK..."                       # optional; omit to use env / IAM role
+secret_access_key = "..."
+addressing_style = "path"                     # optional: path | virtual | auto (default auto)
+verify_ssl = true                             # set false for self-signed TLS
+
+# Pull remote S3 prefixes into backup_dir/{name}_{timestamp}/
+# Set all_buckets = true to discover and sync every bucket the key can list
+# (Garage-compatible via aws s3 ls). Output: {name}_{timestamp}/{bucket}/...
+
+[[s3_sources]]
+name = "garage-all"
+all_buckets = true
+# exclude_buckets = ["scratch", "temp"]   # optional skip list
+
+# Single-bucket source (mutually exclusive with all_buckets):
+
+# [[s3_sources]]
+# name = "assets"
+# bucket = "my-assets-bucket"
+# prefix = "uploads/"                           # optional, default ""
+
+# Per-source overrides (inherit the rest from [s3]):
+# endpoint_url = "http://127.0.0.1:3900"
+# region = "garage"
+# access_key_id = "GK..."
+# secret_access_key = "..."
+# addressing_style = "path"
+# verify_ssl = false
+
+# Upload the full backup_dir to S3 after all sources succeed (before local prune)
+
+[s3_destination]
+bucket = "my-backup-archive"
+prefix = "dante/"                             # optional key prefix
+# endpoint_url = "https://garage.example.com"
+# region = "garage"
+# access_key_id = "GK..."
+# secret_access_key = "..."
+# addressing_style = "path"
+# verify_ssl = true

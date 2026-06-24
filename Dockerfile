@@ -12,13 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client-17 \
+    awscli \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY pg_backup.py /app/pg_backup.py
+COPY backup.py /app/backup.py
 
 # Config is supplied at runtime (bind-mount); see README.
 ENV BACKUP_CONFIG=/config/backup.conf.toml
 
-CMD ["python3", "/app/pg_backup.py"]
+CMD ["python3", "/app/backup.py"]
